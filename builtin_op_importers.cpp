@@ -773,24 +773,26 @@ DEFINE_BUILTIN_OP_IMPORTER(Floor) {
 
 DEFINE_BUILTIN_OP_IMPORTER(Gemm) {
   // Note: Currently this only supports A=tensor, B=weights, C=biases
-  ASSERT(inputs.at(0).is_tensor(),  ErrorCode::kUNSUPPORTED_NODE);
+  ASSERT(inputs.at(0).is_tensor(), ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(inputs.at(1).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(inputs.at(2).is_weights(), ErrorCode::kUNSUPPORTED_NODE);
-  nvinfer1::ITensor* tensor_ptr = &inputs.at(0).tensor();
+  nvinfer1::ITensor *tensor_ptr = &inputs.at(0).tensor();
   auto weights = inputs.at(1).weights();
-  auto biases  = inputs.at(2).weights();
+  auto biases = inputs.at(2).weights();
   OnnxAttrs attrs(node);
   float alpha = attrs.get("alpha", 1.f);
-  float beta  = attrs.get("beta",  1.f);
-  bool broadcast = attrs.get("broadcast", false);
+  float beta = attrs.get("beta", 1.f);
   bool trans_a = attrs.get("transA", false);
   bool trans_b = attrs.get("transB", false);
+  if (ctx->getOpsetVersion() < 7) {
+    ASSERT(attrs.get("broadcast", false), ErrorCode::kUNSUPPORTED_NODE);
+  }
   ASSERT(weights.shape.nbDims == 2, ErrorCode::kUNSUPPORTED_NODE);
   nvinfer1::Dims dims = tensor_ptr->getDimensions();
 #if NV_TENSORRT_MAJOR >= 4
   // Note: TRT requires 3D input for FC layers, so we expand the dims
   bool need_to_expand_dims = (dims.nbDims == 1);
-  if( need_to_expand_dims ) {
+  if (need_to_expand_dims) {
     nvinfer1::DimsCHW new_shape(dims.d[0], 1, 1);
     tensor_ptr = reshape_tensor(ctx, *tensor_ptr, new_shape);
     ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
@@ -800,7 +802,7 @@ DEFINE_BUILTIN_OP_IMPORTER(Gemm) {
   ASSERT(dims.nbDims == 3, ErrorCode::kUNSUPPORTED_NODE);
   int ninput = dims.d[0] * dims.d[1] * dims.d[2];
   ASSERT(!trans_a, ErrorCode::kUNSUPPORTED_NODE);
-  if( !trans_b ) {
+  if (!trans_b) {
     auto new_weights = ctx->createTempWeights(weights.type, weights.shape);
     ASSERT(transposeWeights(weights, {1, 0}, &new_weights),
            ErrorCode::kUNSUPPORTED_NODE);
@@ -808,19 +810,18 @@ DEFINE_BUILTIN_OP_IMPORTER(Gemm) {
   }
   ASSERT(weights.shape.d[1] == ninput, ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(alpha == 1.f, ErrorCode::kUNSUPPORTED_NODE);
-  ASSERT(beta  == 1.f, ErrorCode::kUNSUPPORTED_NODE);
-  ASSERT(broadcast, ErrorCode::kUNSUPPORTED_NODE);
+  ASSERT(beta == 1.f, ErrorCode::kUNSUPPORTED_NODE);
   ASSERT(biases.shape.nbDims == 1, ErrorCode::kUNSUPPORTED_NODE);
   int nrow = biases.shape.d[0];
   ASSERT(weights.shape.d[0] == nrow, ErrorCode::kINVALID_NODE);
-  auto* layer = ctx->network()->addFullyConnected(
-      *tensor_ptr, nrow, weights, biases);
+  auto *layer =
+      ctx->network()->addFullyConnected(*tensor_ptr, nrow, weights, biases);
   ASSERT(layer, ErrorCode::kUNSUPPORTED_NODE);
   tensor_ptr = layer->getOutput(0);
   dims = tensor_ptr->getDimensions();
 #if NV_TENSORRT_MAJOR >= 4
   // Un-expand the dims back to the original shape
-  if( need_to_expand_dims ) {
+  if (need_to_expand_dims) {
     nvinfer1::Dims new_shape{1, {dims.d[0]}};
     tensor_ptr = reshape_tensor(ctx, *tensor_ptr, new_shape);
     ASSERT(tensor_ptr, ErrorCode::kUNSUPPORTED_NODE);
@@ -1295,8 +1296,23 @@ DEFINE_BUILTIN_OP_IMPORTER(Reshape) {
   } else {
     nvinfer1::ITensor& tensor = input.tensor();
     new_shape = set_dims_CHW(remove_dim(new_shape, BATCH_DIM));
-    ASSERT(get_shape_size(new_shape) == get_shape_size(tensor.getDimensions()),
-           ErrorCode::kUNSUPPORTED_NODE);
+    int infer_dim = -1;
+    for (int i = 0; i < new_shape.nbDims; ++i) {
+      if (new_shape.d[i] < 0) {
+        // -1 bears special meaning, which means the current dimension can
+        // be inferred while keepin the total number of elements the same.
+        // https://github.com/onnx/onnx/blob/9b9f595107e3fc0295d50f6294d43879df17552f/onnx/defs/tensor/defs.cc#L73-L75
+        ASSERT(new_shape.d[i] == -1, ErrorCode::kUNSUPPORTED_NODE);
+        // We can only one dimension that has -1
+        ASSERT(infer_dim == -1, ErrorCode::kUNSUPPORTED_NODE);
+        infer_dim = i;
+      }
+    }
+    if (infer_dim < 0) {
+      ASSERT(get_shape_size(new_shape) ==
+                 get_shape_size(tensor.getDimensions()),
+             ErrorCode::kUNSUPPORTED_NODE);
+    }
 #if NV_TENSORRT_MAJOR < 4
     if( new_shape.nbDims == 1 ) {
       // Note: TRT implicitly flattens the input to FC layers, and in fact
