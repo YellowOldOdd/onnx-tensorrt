@@ -37,6 +37,81 @@ using std::endl;
 #include <fcntl.h> // For ::open
 #include <limits>
 
+////////////////////////////////////////////////////////////////////////////////
+#include <cuda_runtime_api.h>
+
+#define CHECK_CUDA(status)                                       \
+  {                                                              \
+    if(status !=  cudaSuccess) {                                 \
+        cout << "CUDA failure: " << cudaGetErrorString(status)   \
+        << " at line: " << __LINE__ << " in file: " << __FILE__; \
+    }                                                            \
+  }
+
+class Int8Calibrator : public nvinfer1::IInt8EntropyCalibrator {
+public:
+  Int8Calibrator(nvinfer1::INetworkDefinition* trt_network) {
+    // cout << "### input num : " << trt_network->getNbInputs() << endl;
+    for (int i = 0; i < trt_network->getNbInputs(); i++) {
+      size_t cnt = 1;
+      nvinfer1::Dims dims = trt_network->getInput(i)->getDimensions();
+      for (int j = 0 ; j < dims.nbDims; j++) {
+        cnt *= dims.d[j];
+      }
+
+      input_names_.push_back(trt_network->getInput(i)->getName());
+      // cout << "### input " << i << "    name : '"
+      //      << input_names_.back() << "'    size : " << cnt << endl;
+
+      float *host_data = new float[cnt];
+      for(size_t i = 0; i < cnt; i++) {
+        host_data[i] = std::rand();;
+      }
+      float *device_data=NULL;
+      size_t size = cnt * sizeof(float);
+      // cout << "### malloc " << cnt << " float" << endl;
+      CHECK_CUDA(cudaMalloc((void**)&device_data, size));
+      CHECK_CUDA(cudaMemcpy(device_data, host_data, size, cudaMemcpyHostToDevice));
+      delete [] host_data;
+      input_data_.push_back(device_data);
+    }
+  }
+
+  ~Int8Calibrator() {
+    for (auto& ptr : input_data_) {
+      CHECK_CUDA(cudaFree(ptr));
+    }
+  }
+
+  int getBatchSize() const override {
+    return 1;
+  }
+
+  bool getBatch(void *bindings[], const char *names[], int nbBindings) override {
+    for (int i = 0; i < nbBindings; i++) {
+      // cout << "### name " << input_names_[i] << endl;
+      // cout << "### name " << names[i] << endl;
+      bindings[i] = input_data_[i];
+    }
+    // cout << "### batch set." << endl;
+    return true;
+  }
+
+  const void *readCalibrationCache(size_t &length) override {
+    return nullptr;
+  }
+
+  void writeCalibrationCache(const void *cache, size_t length) override {
+    return;
+  }
+
+private:
+  std::vector<std::string> input_names_;
+  std::vector<float*>      input_data_;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
 struct InferDeleter {
   template<typename T>
   void operator()(T* obj) const {
@@ -187,11 +262,11 @@ int main(int argc, char* argv[]) {
   nvinfer1::DataType model_dtype;
   if(      model_dtype_nbits == 32 ) { model_dtype = nvinfer1::DataType::kFLOAT; }
   else if( model_dtype_nbits == 16 ) { model_dtype = nvinfer1::DataType::kHALF; }
-  //else if( model_dtype_nbits ==  8 ) { model_dtype = nvinfer1::DataType::kINT8; }
-  else {
-    cerr << "ERROR: Invalid model data type bit depth: " << model_dtype_nbits << endl;
-    return -2;
-  }
+  else if( model_dtype_nbits ==  8 ) { model_dtype = nvinfer1::DataType::kINT8; }
+  // else {
+  //   cerr << "ERROR: Invalid model data type bit depth: " << model_dtype_nbits << endl;
+  //   return -2;
+  // }
 
   ::ONNX_NAMESPACE::ModelProto onnx_model;
   bool is_binary = ParseFromFile_WAR(&onnx_model, onnx_filename.c_str());
@@ -296,6 +371,7 @@ int main(int argc, char* argv[]) {
   }
 
   bool fp16 = trt_builder->platformHasFastFp16();
+  Int8Calibrator calibrator(trt_network.get());
 
   if( !engine_filename.empty() ) {
     if( verbosity >= (int)nvinfer1::ILogger::Severity::kWARNING ) {
@@ -309,9 +385,10 @@ int main(int argc, char* argv[]) {
       trt_builder->setHalf2Mode(true);
     } else if( model_dtype == nvinfer1::DataType::kINT8 ) {
       // TODO: Int8 support
-      //trt_builder->setInt8Mode(true);
-      cerr << "ERROR: Int8 mode not yet supported" << endl;
-      return -5;
+      trt_builder->setInt8Mode(true);
+      trt_builder->setInt8Calibrator(&calibrator);
+      // cerr << "ERROR: Int8 mode not yet supported" << endl;
+      // return -5;
     }
     trt_builder->setDebugSync(debug_builder);
     auto trt_engine = infer_object(trt_builder->buildCudaEngine(*trt_network.get()));
